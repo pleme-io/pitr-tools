@@ -97,9 +97,16 @@
           };
         };
 
+        # v0.1.0 publish path is aarch64-only — the x86_64-linux JIT
+        # builder ASG is currently torn down (memory was stale; the
+        # akeyless-dev quero-builders-x86_64-asg no longer exists).
+        # K8s nodes on EKS Graviton + akeyless-staging-use2 are arm64,
+        # so this still produces a usable image. v0.2 restores amd64
+        # once a Linux build path is back in place.
         releaseApp = substrateLib.mkImageReleaseApp {
           name = "pitr-tools";
           inherit registry mkImage;
+          systems = [ "aarch64-linux" ];
         };
 
         # Local image build for the host system (debugging / `docker load`).
