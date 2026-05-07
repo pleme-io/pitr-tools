@@ -26,73 +26,6 @@
         "diagnostic-collect"
       ];
 
-      # ── Per-arch image builder ────────────────────────────────────────
-      # `system` is one of "x86_64-linux" / "aarch64-linux"; substrate's
-      # mkImageReleaseApp invokes this for each target arch and feeds
-      # both into `forge image-release` for SHA-pinned + -latest tagging
-      # and a multi-arch manifest combine.
-      #
-      # Strategy: cross-compile the Go binaries on the build host (darwin
-      # or linux) — the local nix linux-builder VM is fixed at 3GB by
-      # Determinate (customizing breaks the cache) which is too small
-      # for the akeyless-go SDK's 600+ endpoint compile. Cross-compile
-      # from darwin (M-series, 32-48 GB RAM) using GOOS=linux + the
-      # right GOARCH. Pure-Go build (CGO_ENABLED=0) means no toolchain
-      # cross-deps. dockerTools.buildLayeredImage still runs Linux-side
-      # via the VM but only does layering + tarballing — no compilation.
-      mkImage = system: let
-        # Cross-compile from the host (darwin: 32-48GB) instead of in
-        # the 3GB Determinate linux-builder VM — the akeyless-go SDK's
-        # 600+ endpoint compile OOMs there. pkgsCross is nixpkgs's
-        # canonical cross-compile entrypoint; buildGoModule honors the
-        # cross stdenv automatically (CGO_ENABLED=0 keeps it pure-Go,
-        # so no toolchain tail). dockerTools.buildLayeredImage still
-        # runs Linux-side via the VM but only does layer-tarballing.
-        hostSystem = builtins.currentSystem or "aarch64-darwin";
-        hostPkgs = import nixpkgs { system = hostSystem; };
-        targetPkgs = import nixpkgs { inherit system; };
-        lib = hostPkgs.lib;
-
-        # pkgsCross attribute name keyed on target system.
-        crossPkgs = if system == "aarch64-linux"
-          then hostPkgs.pkgsCross.aarch64-multiplatform
-          else if system == "x86_64-linux"
-          then hostPkgs.pkgsCross.gnu64
-          else throw "pitr-tools: unsupported target system ${system}";
-
-        binaries = crossPkgs.buildGoModule {
-          pname = "pitr-tools";
-          inherit version;
-          src = self;
-          vendorHash = "sha256-vM23v0t/uJNgBoW+uN6k+CW64ePyXmEVoLIm6Ex/ZXk=";
-          subPackages = map (n: "cmd/${n}") binNames;
-          env.CGO_ENABLED = "0";
-          ldflags = [ "-s" "-w" "-X main.version=${version}" ];
-          doCheck = false;
-        };
-        binariesAtRoot = hostPkgs.runCommand "pitr-tools-binaries" {} ''
-          mkdir -p $out
-          ${lib.concatMapStringsSep "\n"
-            (n: "cp ${binaries}/bin/${n} $out/${n}")
-            binNames}
-        '';
-      in targetPkgs.dockerTools.buildLayeredImage {
-        name = "pitr-tools";
-        tag = version;
-        contents = [ binariesAtRoot targetPkgs.cacert ];
-        config = {
-          Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
-          # No Entrypoint — Job sets command=["/notify"] etc. per Job.
-          Labels = {
-            "org.opencontainers.image.source" =
-              "https://github.com/pleme-io/pitr-tools";
-            "org.opencontainers.image.description" =
-              "Crossplane Composition Job binaries for PITR drill harness";
-            "org.opencontainers.image.licenses" = "MIT";
-            "org.opencontainers.image.version" = version;
-          };
-        };
-      };
     in
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -110,6 +43,71 @@
           # `"${forge}/bin/forge"` and would otherwise stringify the
           # source-tree input (no bin/forge in there).
           forge = forge.packages.${system}.default;
+        };
+
+        # ── Per-target-arch image builder ────────────────────────────
+        # substrate's mkImageReleaseApp invokes mkImage once per linux
+        # target system (x86_64-linux, aarch64-linux). The host doing
+        # the compile is the eachDefaultSystem-iterating `pkgs` — i.e.
+        # whatever machine ran `nix run .#release` (rio = x86_64-linux,
+        # cid = aarch64-darwin, ryn = aarch64-darwin).
+        #
+        # When host == target we use buildGoModule directly (native).
+        # When host != target we use pkgsCross (pure-Go via CGO_ENABLED=0
+        # → no toolchain tail beyond the cross-Go binary itself).
+        #
+        # dockerTools.buildLayeredImage still needs to evaluate the
+        # target-system pkgs for the layer-tarballing step.
+        mkImage = targetSystem: let
+          targetPkgs = import nixpkgs { system = targetSystem; };
+
+          # Cross-stdenv selection — only used when host != target.
+          crossPkgs = if targetSystem == "aarch64-linux"
+            then pkgs.pkgsCross.aarch64-multiplatform
+            else if targetSystem == "x86_64-linux"
+            then pkgs.pkgsCross.gnu64
+            else throw "pitr-tools: unsupported target ${targetSystem}";
+
+          # Native if host arch == target arch (and both are linux),
+          # otherwise cross-compile.
+          builderPkgs =
+            if (system == targetSystem) then pkgs else crossPkgs;
+
+          binaries = builderPkgs.buildGoModule {
+            pname = "pitr-tools";
+            inherit version;
+            src = self;
+            vendorHash = "sha256-vM23v0t/uJNgBoW+uN6k+CW64ePyXmEVoLIm6Ex/ZXk=";
+            subPackages = map (n: "cmd/${n}") binNames;
+            env.CGO_ENABLED = "0";
+            ldflags = [ "-s" "-w" "-X main.version=${version}" ];
+            doCheck = false;
+          };
+
+          # Flatten $out/bin/X → /X for the image's root paths. Use
+          # the host pkgs (cheaper — no cross stdenv).
+          binariesAtRoot = pkgs.runCommand "pitr-tools-binaries" {} ''
+            mkdir -p $out
+            ${lib.concatMapStringsSep "\n"
+              (n: "cp ${binaries}/bin/${n} $out/${n}")
+              binNames}
+          '';
+        in targetPkgs.dockerTools.buildLayeredImage {
+          name = "pitr-tools";
+          tag = version;
+          contents = [ binariesAtRoot targetPkgs.cacert ];
+          config = {
+            Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
+            # No Entrypoint — Job sets command=["/notify"] etc. per Job.
+            Labels = {
+              "org.opencontainers.image.source" =
+                "https://github.com/pleme-io/pitr-tools";
+              "org.opencontainers.image.description" =
+                "Crossplane Composition Job binaries for PITR drill harness";
+              "org.opencontainers.image.licenses" = "MIT";
+              "org.opencontainers.image.version" = version;
+            };
+          };
         };
 
         # Per-binary build for local dev (`nix run .#notify -- --help`).
