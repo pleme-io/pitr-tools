@@ -1,0 +1,21 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Nix
+result
+result-*
+.direnv/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local artifacts
+*.tar
+*.tar.gz
