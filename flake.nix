@@ -127,14 +127,16 @@
           };
         };
 
-        # Multi-arch publish (amd64 + arm64). rio (Ryzen 9 9955HX,
-        # x86_64 NixOS, 16C/32T, 32 GB) is the build host — handles
-        # x86_64-linux natively and cross-compiles aarch64-linux via
-        # pkgsCross. The dead quero-x86-builder-ssm ASG path is no
-        # longer the dependency.
+        # v0.1.0: x86_64-linux only — rio (Ryzen 9, x86_64 NixOS) is
+        # the build host. The aarch64-linux variant needs `boot.binfmt.
+        # emulatedSystems = [ "aarch64-linux" ]` on rio so dockerTools.
+        # buildLayeredImage's per-arch base-json drv can be evaluated
+        # there (Go cross-compile already works via pkgsCross). v0.2
+        # picks up arm64 once that's enabled.
         releaseApp = substrateLib.mkImageReleaseApp {
           name = "pitr-tools";
           inherit registry mkImage;
+          systems = [ "x86_64-linux" ];
         };
 
         # Local image build for the host system (debugging / `docker load`).
