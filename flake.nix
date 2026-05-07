@@ -31,10 +31,36 @@
       # mkImageReleaseApp invokes this for each target arch and feeds
       # both into `forge image-release` for SHA-pinned + -latest tagging
       # and a multi-arch manifest combine.
+      #
+      # Strategy: cross-compile the Go binaries on the build host (darwin
+      # or linux) — the local nix linux-builder VM is fixed at 3GB by
+      # Determinate (customizing breaks the cache) which is too small
+      # for the akeyless-go SDK's 600+ endpoint compile. Cross-compile
+      # from darwin (M-series, 32-48 GB RAM) using GOOS=linux + the
+      # right GOARCH. Pure-Go build (CGO_ENABLED=0) means no toolchain
+      # cross-deps. dockerTools.buildLayeredImage still runs Linux-side
+      # via the VM but only does layering + tarballing — no compilation.
       mkImage = system: let
-        pkgs = import nixpkgs { inherit system; };
-        lib = pkgs.lib;
-        binaries = pkgs.buildGoModule {
+        # Cross-compile from the host (darwin: 32-48GB) instead of in
+        # the 3GB Determinate linux-builder VM — the akeyless-go SDK's
+        # 600+ endpoint compile OOMs there. pkgsCross is nixpkgs's
+        # canonical cross-compile entrypoint; buildGoModule honors the
+        # cross stdenv automatically (CGO_ENABLED=0 keeps it pure-Go,
+        # so no toolchain tail). dockerTools.buildLayeredImage still
+        # runs Linux-side via the VM but only does layer-tarballing.
+        hostSystem = builtins.currentSystem or "aarch64-darwin";
+        hostPkgs = import nixpkgs { system = hostSystem; };
+        targetPkgs = import nixpkgs { inherit system; };
+        lib = hostPkgs.lib;
+
+        # pkgsCross attribute name keyed on target system.
+        crossPkgs = if system == "aarch64-linux"
+          then hostPkgs.pkgsCross.aarch64-multiplatform
+          else if system == "x86_64-linux"
+          then hostPkgs.pkgsCross.gnu64
+          else throw "pitr-tools: unsupported target system ${system}";
+
+        binaries = crossPkgs.buildGoModule {
           pname = "pitr-tools";
           inherit version;
           src = self;
@@ -42,17 +68,18 @@
           subPackages = map (n: "cmd/${n}") binNames;
           env.CGO_ENABLED = "0";
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
+          doCheck = false;
         };
-        binariesAtRoot = pkgs.runCommand "pitr-tools-binaries" {} ''
+        binariesAtRoot = hostPkgs.runCommand "pitr-tools-binaries" {} ''
           mkdir -p $out
           ${lib.concatMapStringsSep "\n"
             (n: "cp ${binaries}/bin/${n} $out/${n}")
             binNames}
         '';
-      in pkgs.dockerTools.buildLayeredImage {
+      in targetPkgs.dockerTools.buildLayeredImage {
         name = "pitr-tools";
         tag = version;
-        contents = [ binariesAtRoot pkgs.cacert ];
+        contents = [ binariesAtRoot targetPkgs.cacert ];
         config = {
           Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
           # No Entrypoint — Job sets command=["/notify"] etc. per Job.
@@ -77,7 +104,12 @@
         # entry that drives `forge image-release` (amd64+arm64 build,
         # GHCR push, multi-arch manifest combine).
         substrateLib = substrate.libFor {
-          inherit pkgs system forge;
+          inherit pkgs system;
+          # Substrate's libFor expects the *forge package*, not the
+          # flake input — its forgeCmd resolution does
+          # `"${forge}/bin/forge"` and would otherwise stringify the
+          # source-tree input (no bin/forge in there).
+          forge = forge.packages.${system}.default;
         };
 
         # Per-binary build for local dev (`nix run .#notify -- --help`).
@@ -97,16 +129,14 @@
           };
         };
 
-        # v0.1.0 publish path is aarch64-only — the x86_64-linux JIT
-        # builder ASG is currently torn down (memory was stale; the
-        # akeyless-dev quero-builders-x86_64-asg no longer exists).
-        # K8s nodes on EKS Graviton + akeyless-staging-use2 are arm64,
-        # so this still produces a usable image. v0.2 restores amd64
-        # once a Linux build path is back in place.
+        # Multi-arch publish (amd64 + arm64). rio (Ryzen 9 9955HX,
+        # x86_64 NixOS, 16C/32T, 32 GB) is the build host — handles
+        # x86_64-linux natively and cross-compiles aarch64-linux via
+        # pkgsCross. The dead quero-x86-builder-ssm ASG path is no
+        # longer the dependency.
         releaseApp = substrateLib.mkImageReleaseApp {
           name = "pitr-tools";
           inherit registry mkImage;
-          systems = [ "aarch64-linux" ];
         };
 
         # Local image build for the host system (debugging / `docker load`).
