@@ -34,19 +34,30 @@ type Client struct {
 	token string
 }
 
-// AuthConfig is the operator-supplied per-tenant configuration for the k8s
-// auth method. AccessID + ConfigName are populated by ASM-18083 coordination
-// (PITR Project Hub Confluence page 4042457094) and threaded into the chart
-// via ApplicationSet helm.parameters → ConfigMap → env vars on Job containers.
+// AuthConfig is the operator-supplied per-tenant configuration. The Client
+// supports two auth modes:
+//
+//   - **k8s auth method** (Decision 13; production): AccessID + ConfigName
+//     populated by ASM-18083 coordination (PITR Project Hub Confluence page
+//     4042457094); the Job pod's projected SA token is the credential.
+//   - **api-key auth** (smoke / pre-coordination): AccessID + AccessKey
+//     populated from a static admin auth method (e.g. pitr-provisioning).
+//     Used when the per-drill k8s auth method on akeyless hasn't been
+//     materialized yet, or when the operator is running an offline /
+//     debugging drill against the source saas. Mode is selected by
+//     populating either ConfigName (k8s) or AccessKey (api-key).
 type AuthConfig struct {
 	GatewayURL  string // e.g. https://saas-uam-service-ingress.default.svc.cluster.local:443
 	AccessID    string // p-... (per-tenant)
-	ConfigName  string // k8s auth config name on the akeyless side (per-tenant)
-	SATokenPath string // optional; defaults to DefaultSATokenPath
+	ConfigName  string // k8s auth config name (per-tenant) — empty means api-key path
+	AccessKey   string // raw access key for api-key auth — empty means k8s path
+	SATokenPath string // optional; defaults to DefaultSATokenPath (k8s path only)
 }
 
-// NewClient authenticates via the akeyless k8s auth method and returns a
-// Client carrying the resulting temp token.
+// NewClient authenticates via either the akeyless k8s auth method (when
+// AuthConfig.ConfigName is set) or the api-key auth method (when
+// AuthConfig.AccessKey is set), and returns a Client carrying the resulting
+// temp token. Returns an error if neither field is set.
 func NewClient(ctx context.Context, cfg AuthConfig) (*Client, error) {
 	if cfg.GatewayURL == "" {
 		return nil, errors.New("akeyless: AuthConfig.GatewayURL is empty")
@@ -54,20 +65,8 @@ func NewClient(ctx context.Context, cfg AuthConfig) (*Client, error) {
 	if cfg.AccessID == "" {
 		return nil, errors.New("akeyless: AuthConfig.AccessID is empty")
 	}
-	if cfg.ConfigName == "" {
-		return nil, errors.New("akeyless: AuthConfig.ConfigName is empty")
-	}
-	tokenPath := cfg.SATokenPath
-	if tokenPath == "" {
-		tokenPath = DefaultSATokenPath
-	}
-	saTokenBytes, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("akeyless: read SA token at %q: %w", tokenPath, err)
-	}
-	saToken := strings.TrimSpace(string(saTokenBytes))
-	if saToken == "" {
-		return nil, fmt.Errorf("akeyless: SA token at %q is empty", tokenPath)
+	if cfg.ConfigName == "" && cfg.AccessKey == "" {
+		return nil, errors.New("akeyless: AuthConfig must set ConfigName (k8s mode) OR AccessKey (api-key mode)")
 	}
 
 	apiCfg := akl.NewConfiguration()
@@ -75,14 +74,38 @@ func NewClient(ctx context.Context, cfg AuthConfig) (*Client, error) {
 	api := akl.NewAPIClient(apiCfg)
 
 	authReq := akl.NewAuth()
-	authReq.SetAccessType("k8s")
 	authReq.SetAccessId(cfg.AccessID)
-	authReq.SetK8sAuthConfigName(cfg.ConfigName)
-	authReq.SetK8sServiceAccountToken(saToken)
+
+	if cfg.AccessKey != "" {
+		// api-key path: no SA token, no k8s config name
+		authReq.SetAccessType("access_key")
+		authReq.SetAccessKey(cfg.AccessKey)
+	} else {
+		// k8s path: read SA token from projected volume
+		tokenPath := cfg.SATokenPath
+		if tokenPath == "" {
+			tokenPath = DefaultSATokenPath
+		}
+		saTokenBytes, err := os.ReadFile(tokenPath)
+		if err != nil {
+			return nil, fmt.Errorf("akeyless: read SA token at %q: %w", tokenPath, err)
+		}
+		saToken := strings.TrimSpace(string(saTokenBytes))
+		if saToken == "" {
+			return nil, fmt.Errorf("akeyless: SA token at %q is empty", tokenPath)
+		}
+		authReq.SetAccessType("k8s")
+		authReq.SetK8sAuthConfigName(cfg.ConfigName)
+		authReq.SetK8sServiceAccountToken(saToken)
+	}
 
 	authOut, _, err := api.V2Api.Auth(ctx).Body(*authReq).Execute()
 	if err != nil {
-		return nil, fmt.Errorf("akeyless: auth (k8s): %w", err)
+		mode := "k8s"
+		if cfg.AccessKey != "" {
+			mode = "access_key"
+		}
+		return nil, fmt.Errorf("akeyless: auth (%s): %w", mode, err)
 	}
 	if authOut == nil || authOut.Token == nil || *authOut.Token == "" {
 		return nil, errors.New("akeyless: auth succeeded but response carried no token")

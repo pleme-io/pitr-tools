@@ -55,7 +55,18 @@ func main() {
 	)
 	flag.Parse()
 
-	if err := requireFlags(*correlationID, *restoredURL, *accessID, *configName); err != nil {
+	// Auth mode dispatch:
+	//   AKEYLESS_ACCESS_KEY env set → api-key auth (smoke / pre-coordination)
+	//   --k8s-auth-config flag set → k8s auth method (production / ASM-18083)
+	// Either is valid; both unset is an error. The cluster-side Job is
+	// expected to inject AKEYLESS_ACCESS_KEY via a Secret-mounted env var
+	// (NEVER argv) when running in api-key mode.
+	apiKey := os.Getenv("AKEYLESS_ACCESS_KEY")
+	if apiKey == "" && *configName == "" {
+		fmt.Fprintln(os.Stderr, "verify: must set either --k8s-auth-config (k8s mode) OR AKEYLESS_ACCESS_KEY env (api-key mode)")
+		os.Exit(2)
+	}
+	if err := requireFlagsRelaxed(*correlationID, *restoredURL, *accessID); err != nil {
 		fmt.Fprintln(os.Stderr, "verify:", err.Error())
 		os.Exit(2)
 	}
@@ -72,7 +83,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *maxWait+5*time.Minute)
 	defer cancel()
 
-	client, err := pollUntilAuthSucceeds(ctx, logger, *restoredURL, *accessID, *configName, *maxWait, *pollInterval)
+	client, err := pollUntilAuthSucceeds(ctx, logger, *restoredURL, *accessID, *configName, apiKey, *maxWait, *pollInterval)
 	if err != nil {
 		logger.Error("restored akeyless never authenticated", "max_wait", maxWait.String(), "error", err.Error())
 		os.Exit(1)
@@ -123,10 +134,14 @@ func main() {
 // the maxWait elapses. The restored akeyless deployment isn't reachable
 // until saas-pitr's Helm release reconciles + the restored RDS endpoint
 // accepts connections — empirically 10-20 min for first-iteration drills.
+//
+// Auth mode chosen by which credential is non-empty:
+//   - apiKey set     → access_key auth (admin / smoke)
+//   - configName set → k8s auth method (production / Decision 13)
 func pollUntilAuthSucceeds(
 	ctx context.Context,
 	logger interface{ Info(string, ...any) },
-	url, accessID, configName string,
+	url, accessID, configName, apiKey string,
 	maxWait, interval time.Duration,
 ) (*akeyless.Client, error) {
 	deadline := time.Now().Add(maxWait)
@@ -136,6 +151,7 @@ func pollUntilAuthSucceeds(
 			GatewayURL: url,
 			AccessID:   accessID,
 			ConfigName: configName,
+			AccessKey:  apiKey,
 		})
 		if err == nil {
 			return client, nil
@@ -193,6 +209,25 @@ func requireFlags(correlationID, restoredURL, accessID, configName string) error
 	}
 	if configName == "" {
 		missing = append(missing, "--k8s-auth-config")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("required args missing: %v", missing)
+}
+
+// requireFlagsRelaxed validates the always-required args. The auth mode
+// dispatch (k8s vs api-key) is checked separately by the caller.
+func requireFlagsRelaxed(correlationID, restoredURL, accessID string) error {
+	missing := []string{}
+	if correlationID == "" {
+		missing = append(missing, "--correlation-id")
+	}
+	if restoredURL == "" {
+		missing = append(missing, "--restored-akeyless-url")
+	}
+	if accessID == "" {
+		missing = append(missing, "--akeyless-access-id")
 	}
 	if len(missing) == 0 {
 		return nil
