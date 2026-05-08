@@ -34,6 +34,19 @@ type Client struct {
 	token string
 }
 
+// WithGatewayURL returns a new Client with the same auth token but pointing
+// at a different gateway URL. Used in the drill verify path: akeyless
+// production routes paths via an Ingress (e.g. /auth → auth microservice,
+// /describe-item → uam microservice) but the per-microservice saas-pitr
+// Pods don't have that router. So the drill auths against auth-svc, then
+// queries items against uam-svc, each as its own client carrying the
+// shared token.
+func (c *Client) WithGatewayURL(url string) *Client {
+	apiCfg := akl.NewConfiguration()
+	apiCfg.Servers = []akl.ServerConfiguration{{URL: url}}
+	return &Client{api: akl.NewAPIClient(apiCfg), token: c.token}
+}
+
 // AuthConfig is the operator-supplied per-tenant configuration. The Client
 // supports two auth modes:
 //

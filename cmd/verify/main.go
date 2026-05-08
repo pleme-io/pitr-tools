@@ -46,7 +46,8 @@ const (
 func main() {
 	var (
 		correlationID = flag.String("correlation-id", "", "drill correlation_id")
-		restoredURL   = flag.String("restored-akeyless-url", "", "restored akeyless gateway URL (in the restore-* namespace)")
+		restoredURL   = flag.String("restored-akeyless-url", "", "restored akeyless gateway URL — used for /auth (typically the auth microservice service ingress in restore-* ns)")
+		uamURL        = flag.String("restored-uam-url", "", "restored akeyless UAM service URL — used for /describe-item (typically the uam microservice service ingress in restore-* ns); empty = use restored-akeyless-url for both")
 		accessID      = flag.String("akeyless-access-id", "", "akeyless k8s auth method access ID (same as source — restored env is a snapshot)")
 		configName    = flag.String("k8s-auth-config", "", "akeyless k8s auth config name (same as source)")
 		secretPaths   = flag.String("secret-paths", "", "comma-separated akeyless paths to verify; empty = auto-canary path /drill-canary/<hash>")
@@ -83,16 +84,29 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *maxWait+5*time.Minute)
 	defer cancel()
 
-	client, err := pollUntilAuthSucceeds(ctx, logger, *restoredURL, *accessID, *configName, apiKey, *maxWait, *pollInterval)
+	authClient, err := pollUntilAuthSucceeds(ctx, logger, *restoredURL, *accessID, *configName, apiKey, *maxWait, *pollInterval)
 	if err != nil {
 		logger.Error("restored akeyless never authenticated", "max_wait", maxWait.String(), "error", err.Error())
 		os.Exit(1)
 	}
 
+	// Akeyless production routes API paths via an Ingress (e.g. /auth →
+	// auth microservice, /describe-item → uam microservice). Per-microservice
+	// saas-pitr Pods don't have that router. So auth happened against the
+	// auth-svc URL above; item lookups now run against the uam-svc URL with
+	// the same session token. When --restored-uam-url is empty, fall back
+	// to the auth URL (legacy behavior + tests against environments with a
+	// unified gateway).
+	itemClient := authClient
+	if *uamURL != "" && *uamURL != *restoredURL {
+		itemClient = authClient.WithGatewayURL(*uamURL)
+		logger.Info("split-URL routing: auth via auth-svc, items via uam-svc", "auth_url", *restoredURL, "uam_url", *uamURL)
+	}
+
 	retrieved := []string{}
 	missing := []string{}
 	for _, p := range paths {
-		if err := client.DescribeItem(ctx, p); err != nil {
+		if err := itemClient.DescribeItem(ctx, p); err != nil {
 			logger.Error("secret missing in restored env", "path", p, "error", err.Error())
 			missing = append(missing, p)
 			continue
