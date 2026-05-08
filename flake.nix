@@ -77,7 +77,7 @@
             pname = "pitr-tools";
             inherit version;
             src = self;
-            vendorHash = "sha256-vM23v0t/uJNgBoW+uN6k+CW64ePyXmEVoLIm6Ex/ZXk=";
+            vendorHash = "sha256-4vavYlYKTZci3xAPzKn7ZS0yd75KcwlXC7+4vbQbsU8=";
             subPackages = map (n: "cmd/${n}") binNames;
             env.CGO_ENABLED = "0";
             ldflags = [ "-s" "-w" "-X main.version=${version}" ];
@@ -115,7 +115,7 @@
           pname = "pitr-tools";
           inherit version;
           src = self;
-          vendorHash = "sha256-vM23v0t/uJNgBoW+uN6k+CW64ePyXmEVoLIm6Ex/ZXk=";
+          vendorHash = "sha256-4vavYlYKTZci3xAPzKn7ZS0yd75KcwlXC7+4vbQbsU8=";
           subPackages = map (n: "cmd/${n}") binNames;
           env.CGO_ENABLED = "0";
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
