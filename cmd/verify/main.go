@@ -33,6 +33,7 @@ import (
 	"github.com/pleme-io/pitr-tools/internal/akeyless"
 	"github.com/pleme-io/pitr-tools/internal/correlation"
 	"github.com/pleme-io/pitr-tools/internal/log"
+	"github.com/pleme-io/pitr-tools/internal/result"
 )
 
 // Default poll loop bounds. Tuned for the saas-pitr Helm release coming up
@@ -77,18 +78,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	failed := []string{}
+	retrieved := []string{}
+	missing := []string{}
 	for _, p := range paths {
 		if err := client.DescribeItem(ctx, p); err != nil {
 			logger.Error("secret missing in restored env", "path", p, "error", err.Error())
-			failed = append(failed, p)
+			missing = append(missing, p)
 			continue
 		}
+		retrieved = append(retrieved, p)
 		logger.Info("secret found", "path", p)
 	}
 
-	if len(failed) > 0 {
-		logger.Error("verify failed; secrets missing from restored env", "missing", failed)
+	// Persist outcome for the chart's status.retrievedSecrets[] composition
+	// ref to consume, regardless of pass/fail (partial-failure case still
+	// surfaces what was retrieved). ConfigMap write failures do NOT change
+	// the Job's exit code — verify already succeeded or failed on its own
+	// merits; the result-write is best-effort observability that the chart
+	// can poll-then-give-up if it never lands.
+	phase := result.PhaseSucceeded
+	if len(missing) > 0 {
+		phase = result.PhaseFailed
+	}
+	cmName, err := result.WriteConfigMap(ctx, os.Getenv("POD_NAMESPACE"), result.Outcome{
+		CorrelationID:    *correlationID,
+		RetrievedSecrets: retrieved,
+		MissingSecrets:   missing,
+		Phase:            phase,
+	})
+	if err != nil {
+		logger.Error("write result configmap (verify Job's stdout still authoritative)", "error", err.Error())
+	} else {
+		logger.Info("result configmap written", "configmap", cmName, "retrieved_count", len(retrieved), "missing_count", len(missing))
+	}
+
+	if len(missing) > 0 {
+		logger.Error("verify failed; secrets missing from restored env", "missing", missing)
 		os.Exit(1)
 	}
 	logger.Info("verify succeeded; all requested secrets present in restored env", "count", len(paths))
