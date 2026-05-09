@@ -150,11 +150,23 @@ func main() {
 
 // waitAll spawns concurrent watchers:
 //   - one HTTP /health poll per --service URL (success = all 200 at least once)
-//   - one K8s Pod watch per --watch-pod target (success = ctx done before any
-//     unrecoverable state; failure = unrecoverable state detected)
+//   - one K8s Pod watch per --watch-pod target (fail-fast guard only — runs
+//     until ctx.Done; never gates success on its own)
 //
-// Returns nil only when every --service has responded 200 AND no Pod watcher
-// has reported an unrecoverable state. Returns the first error otherwise.
+// Returns nil when every --service has responded 200 (and no Pod watcher
+// has reported an unrecoverable state in that window). Returns the first
+// error otherwise.
+//
+// Important: the watchPod goroutines are FAIL-FAST GUARDS, not success
+// signals. They run alongside service polls and CANCEL the whole waitAll
+// the moment they detect an unrecoverable upstream state. They do NOT have
+// to "complete" before waitAll returns success — once all services are
+// 200, we cancel ctx (which makes watchPods exit cleanly) and return.
+//
+// Without this distinction, waitAll would block on `wg.Wait()` waiting for
+// watchPod goroutines that only exit on ctx.Done — meaning every successful
+// invocation would burn the full --max-wait deadline despite the services
+// being ready in seconds. (Bug observed in drill #7 with v0.3.1.)
 func waitAll(
 	ctx context.Context,
 	logger loggerIface,
@@ -164,46 +176,70 @@ func waitAll(
 	maxRestarts int,
 	clientset *kubernetes.Clientset,
 ) error {
-	// failFast cancels the whole waitAll when any watcher reports unrecoverable.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	errs := make(chan error, len(services)+len(watchPods))
 	client := &http.Client{Timeout: requestTimeout}
 
+	// Service-poll goroutines: each returns nil on success, error on timeout.
+	// We block on these until ALL services succeed (or any times out).
+	serviceErrs := make(chan error, len(services))
+	var serviceWg sync.WaitGroup
 	for _, svc := range services {
-		wg.Add(1)
+		serviceWg.Add(1)
 		go func(url string) {
-			defer wg.Done()
-			err := waitOne(ctx, logger, client, url, interval)
-			errs <- err
+			defer serviceWg.Done()
+			serviceErrs <- waitOne(ctx, logger, client, url, interval)
 		}(svc)
 	}
 
+	// Pod-watch goroutines: fail-fast guards only. They cancel ctx on
+	// unrecoverable detection, otherwise just block until ctx is cancelled
+	// (either by service success or by an upstream deadline).
+	podErrs := make(chan error, len(watchPods))
+	var podWg sync.WaitGroup
 	for _, target := range watchPods {
-		wg.Add(1)
+		podWg.Add(1)
 		go func(spec string) {
-			defer wg.Done()
+			defer podWg.Done()
 			err := watchPod(ctx, logger, clientset, spec, maxRestarts)
 			if err != nil {
-				// Unrecoverable Pod state — cancel everyone else.
-				cancel()
-				errs <- err
+				cancel() // unrecoverable upstream — abort service polls too
+				podErrs <- err
 			}
 		}(target)
 	}
 
-	wg.Wait()
-	close(errs)
+	// Wait for service polls to finish — definite end (success or timeout).
+	serviceWg.Wait()
+	close(serviceErrs)
 
-	var combined []error
-	for err := range errs {
+	var serviceFailed []error
+	for err := range serviceErrs {
 		if err != nil {
-			combined = append(combined, err)
+			serviceFailed = append(serviceFailed, err)
 		}
 	}
-	return errors.Join(combined...)
+
+	// Service polls done — release the pod watchers regardless of outcome.
+	cancel()
+	podWg.Wait()
+	close(podErrs)
+
+	var podFailed []error
+	for err := range podErrs {
+		if err != nil {
+			podFailed = append(podFailed, err)
+		}
+	}
+
+	// Pod-watch errors are reported only when service polls succeeded —
+	// indicates an unrecoverable was detected DURING the service-success
+	// window. If services failed, that's the primary signal.
+	if len(serviceFailed) > 0 {
+		return errors.Join(serviceFailed...)
+	}
+	return errors.Join(podFailed...)
 }
 
 // waitOne polls a single URL until it returns 200 or ctx is done.
