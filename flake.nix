@@ -1,5 +1,5 @@
 {
-  description = "pitr-tools — six Go binaries for PITR drill Jobs, shipped as a single multi-arch container image";
+  description = "pitr-tools — seven Go binaries for PITR drill Jobs, shipped as a single multi-arch container image";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -16,7 +16,7 @@
 
   outputs = { self, nixpkgs, flake-utils, substrate, forge, ... }:
     let
-      version = "0.3.7";
+      version = "0.3.8";
       registry = "ghcr.io/pleme-io/pitr-tools";
       binNames = [
         "notify"
@@ -25,6 +25,7 @@
         "verify"
         "diagnostic-collect"
         "wait-for-deps"
+        "cleanup"
       ];
 
     in
