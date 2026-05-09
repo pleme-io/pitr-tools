@@ -29,7 +29,15 @@ func main() {
 	)
 	flag.Parse()
 
-	if err := requireFlags(*correlationID, *sourceURL, *accessID, *configName); err != nil {
+	// Auth mode dispatch (mirrors verify + canary-create):
+	//   AKEYLESS_ACCESS_KEY env set → api-key auth (smoke / pre-coordination)
+	//   --k8s-auth-config flag set → k8s auth method (production / ASM-18083)
+	apiKey := os.Getenv("AKEYLESS_ACCESS_KEY")
+	if apiKey == "" && *configName == "" {
+		fmt.Fprintln(os.Stderr, "canary-delete: must set either --k8s-auth-config (k8s mode) OR AKEYLESS_ACCESS_KEY env (api-key mode)")
+		os.Exit(2)
+	}
+	if err := requireFlagsRelaxed(*correlationID, *sourceURL, *accessID); err != nil {
 		fmt.Fprintln(os.Stderr, "canary-delete:", err.Error())
 		os.Exit(2)
 	}
@@ -50,6 +58,7 @@ func main() {
 		GatewayURL: *sourceURL,
 		AccessID:   *accessID,
 		ConfigName: *configName,
+		AccessKey:  apiKey,
 	})
 	if err != nil {
 		logger.Error("akeyless k8s auth failed", "error", err.Error())
@@ -63,6 +72,8 @@ func main() {
 	logger.Info("canary deleted (idempotent — 404 treated as success)", "path", canaryPath)
 }
 
+// Strict (k8s mode) — kept for backwards-compatible test coverage. main()
+// uses requireFlagsRelaxed; auth mode is dispatched separately.
 func requireFlags(correlationID, sourceURL, accessID, configName string) error {
 	missing := []string{}
 	if correlationID == "" {
@@ -76,6 +87,24 @@ func requireFlags(correlationID, sourceURL, accessID, configName string) error {
 	}
 	if configName == "" {
 		missing = append(missing, "--k8s-auth-config")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("required args missing: %v", missing)
+}
+
+// requireFlagsRelaxed validates the always-required args (auth mode handled separately).
+func requireFlagsRelaxed(correlationID, sourceURL, accessID string) error {
+	missing := []string{}
+	if correlationID == "" {
+		missing = append(missing, "--correlation-id")
+	}
+	if sourceURL == "" {
+		missing = append(missing, "--source-akeyless-url")
+	}
+	if accessID == "" {
+		missing = append(missing, "--akeyless-access-id")
 	}
 	if len(missing) == 0 {
 		return nil
