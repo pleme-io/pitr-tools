@@ -374,11 +374,31 @@ func runPresenceModeAndExit(logger interface {
 		"missing_count", len(missing),
 	)
 
+	// Job exit code reflects "did the report happen" — NOT "what does the
+	// report say". This is the deterministic-flow principle applied to the
+	// Job/Pod boundary: once drill-result-<correlation> has phase set,
+	// downstream consumers (cleanup binary, observe Object, status
+	// reflection) read the OUTCOME from the ConfigMap. A non-zero Job exit
+	// triggers backoffLimit retries; if cleanup tore down the namespace
+	// in between, retried Pods spawn with init containers stuck pointing
+	// at services that no longer exist — the very hang we just engineered
+	// out for MR conditions.
+	//
+	// So: if the ConfigMap was written with a phase, exit 0. The Job did
+	// its job. The drill's pass/fail is in the ConfigMap data. Operators
+	// inspecting `kubectl get jobs` see "Succeeded" for both successful
+	// drills and reported-failed drills; that's correct semantics — the
+	// REPORTING succeeded. Drill outcome is in the data.
+	//
+	// Errors during the check process itself (e.g., k8s API unreachable)
+	// SHOULD still fail the Job — those are transient and a retry is the
+	// right answer. We only swap exit code when checks completed AND the
+	// outcome was persisted.
 	if !allOk {
-		logger.Error("presence checks failed; report includes diagnostics for each failed check",
+		logger.Error("presence checks reported failure; outcome persisted in ConfigMap, exit 0 to prevent retry-spawn after cleanup teardown",
 			"failed_count", fail,
 		)
-		os.Exit(1)
+		os.Exit(0)
 	}
 	logger.Info("verify-presence succeeded; all checks passed", "count", pass)
 	os.Exit(0)

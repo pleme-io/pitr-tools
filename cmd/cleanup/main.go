@@ -362,7 +362,58 @@ func executeTeardown(ctx context.Context, dyn dynamic.Interface, k8s kubernetes.
 		}
 	}
 
+	// 3. Reap peer Jobs (defense-in-depth, complements verify's exit-0-on-
+	//    outcome-written behavior in v0.3.9). Once the drill outcome is
+	//    persisted to the result ConfigMap and cleanup has decided
+	//    Teardown, ANY remaining Jobs labeled with this correlation_id are
+	//    just retry-spawn noise. Cascade-deletes their Pods.
+	//
+	//    self-exclusion: cleanup Job carries `pitr-job-kind=cleanup`. We
+	//    can't delete ourselves mid-execution (kubelet would SIGKILL the
+	//    Pod before this function returns). field-selector excludes the
+	//    cleanup Job by name; the cleanup Job's own Object MR is reaped
+	//    by the operator's `kubectl delete pitrsession` cascade (cheap
+	//    K8s objects with no AWS cost).
+	myJobName := os.Getenv("JOB_NAME") // chart sets via downward API; empty in dev
+	jobs, err := k8s.BatchV1().Jobs(jobsNs(restoreNs)).List(ctx, metav1.ListOptions{
+		LabelSelector: "pitr-correlation-id=" + correlationID,
+	})
+	if err != nil {
+		errs = append(errs, fmt.Errorf("list peer Jobs: %w", err))
+	} else {
+		for _, j := range jobs.Items {
+			if myJobName != "" && j.Name == myJobName {
+				logger.Info("skip peer Job (self)", "job", j.Name)
+				continue
+			}
+			fg := metav1.DeletePropagationForeground
+			if err := k8s.BatchV1().Jobs(j.Namespace).Delete(ctx, j.Name, metav1.DeleteOptions{
+				PropagationPolicy: &fg,
+			}); err != nil {
+				if !apierrors.IsNotFound(err) {
+					errs = append(errs, fmt.Errorf("delete peer Job %s: %w", j.Name, err))
+					continue
+				}
+			} else {
+				deleted++
+				logger.Info("deleted peer Job", "job", j.Name, "namespace", j.Namespace)
+			}
+		}
+	}
+
 	return deleted, errs
+}
+
+// jobsNs returns the namespace cleanup looks for peer Jobs in. The chart's
+// canary-create / canary-delete / verify / diagnostic-collect / cleanup
+// Jobs all live in the chart's release namespace (pitr-akeyless), NOT the
+// per-drill restore-* namespace. POD_NAMESPACE env carries the chart's ns.
+// Falls back to the restoreNs derivation if env is unset (dev / test).
+func jobsNs(restoreNs string) string {
+	if v := os.Getenv("POD_NAMESPACE"); v != "" {
+		return v
+	}
+	return "pitr-akeyless"
 }
 
 // writeCleanupOutcome appends cleanup_status + cleanup_reason +
