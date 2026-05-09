@@ -42,15 +42,36 @@ const (
 	PhaseFailed    Phase = "Failed"
 )
 
+// CheckSummary is one verify Check's outcome plus its gathered diagnostics.
+// Mirrors cmd/verify/presence.go:CheckResult but lives here so it can be
+// embedded in Outcome without creating an import cycle. Diagnostics is a
+// flat string→string map (kubectl-describe-friendly + JSON-friendly + can
+// be lifted into Composition status by function-extra-resources without
+// nested-shape gymnastics).
+type CheckSummary struct {
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Passed      bool              `json:"passed"`
+	Message     string            `json:"message,omitempty"`
+	Diagnostics map[string]string `json:"diagnostics,omitempty"`
+	DurationMs  int64             `json:"duration_ms,omitempty"`
+}
+
 // Outcome is the structured shape the verify Job persists. Marshaled to
 // the ConfigMap's `retrievedSecrets` data key as a JSON array of strings;
 // counts are written as separate keys for human-readable kubectl-describe
 // output without re-parsing JSON.
+//
+// Checks (added 2026-05-09 with --mode=presence) carries per-Check
+// pass/fail + diagnostics so the operator's report aggregates every
+// failure mode the run encountered (no fail-fast). When Checks is
+// empty, callers (api-mode) get the legacy retrievedSecrets-only shape.
 type Outcome struct {
-	CorrelationID    string   `json:"correlation_id"`
-	RetrievedSecrets []string `json:"retrieved_secrets"`
-	MissingSecrets   []string `json:"missing_secrets"`
-	Phase            Phase    `json:"phase"`
+	CorrelationID    string         `json:"correlation_id"`
+	RetrievedSecrets []string       `json:"retrieved_secrets"`
+	MissingSecrets   []string       `json:"missing_secrets"`
+	Phase            Phase          `json:"phase"`
+	Checks           []CheckSummary `json:"checks,omitempty"`
 }
 
 // WriteConfigMap upserts a ConfigMap named drill-result-<correlationID>
@@ -118,6 +139,25 @@ func writeWithClient(ctx context.Context, api corev1typed.ConfigMapInterface, na
 			"phase":            string(outcome.Phase),
 			"correlationId":    outcome.CorrelationID,
 		},
+	}
+
+	if len(outcome.Checks) > 0 {
+		checksJSON, err := json.Marshal(outcome.Checks)
+		if err != nil {
+			return fmt.Errorf("marshal checks: %w", err)
+		}
+		passed, failed := 0, 0
+		for _, c := range outcome.Checks {
+			if c.Passed {
+				passed++
+			} else {
+				failed++
+			}
+		}
+		desired.Data["checks"] = string(checksJSON)
+		desired.Data["totalChecks"] = strconv.Itoa(len(outcome.Checks))
+		desired.Data["checksPassed"] = strconv.Itoa(passed)
+		desired.Data["checksFailed"] = strconv.Itoa(failed)
 	}
 
 	_, err = api.Create(ctx, desired, metav1.CreateOptions{})

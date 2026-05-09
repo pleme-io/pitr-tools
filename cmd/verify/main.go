@@ -66,19 +66,36 @@ func main() {
 	}
 	logger.Info("verify scope", "paths", paths, "mode", *mode)
 
-	// Presence mode: skip /auth + /describe-item entirely. The Composition's
-	// upstream gates (4 RDS PITR Ready, 6 saas Pods Ready, canary-create Job
-	// succeeded) are the proof; verify just records the canary path as
-	// retrieved. Matches the human-script bar (which never validates auth
-	// post-restore — its drill ends at "Pods are Ready"). When the
-	// akeyless-internals are sufficiently understood to run a real /auth +
-	// /describe-item against the restored saas, flip mode to api.
+	// Presence mode: skip /auth + /describe-item entirely. Run the
+	// presence Check stack (presence.go) — each Check mirrors one
+	// implicit verification the human-driven PITR script performs by
+	// the time it reaches its "finished successfully!!!" echo:
+	//   - rds-pitr-ready (terraform apply succeeded)
+	//   - configmaps-cloned (kubectl apply line 159-163 ran)
+	//   - saas-deployments-ready (helm install rolled out)
+	//   - canary-create-succeeded (canary written on source pre-snapshot)
+	// Errors accumulate (no fail-fast); each failed Check carries its own
+	// Diagnostics map. Outcome.Checks aggregates the full report; the
+	// chart's observe Object lifts it into the XR's status.
+	//
+	// New Checks (auth-against-restored-saas, route53-records-present)
+	// extend the slice in presence.go without touching this dispatch.
 	if *mode == "presence" {
 		if *correlationID == "" {
 			fmt.Fprintln(os.Stderr, "verify: --correlation-id required even in presence mode")
 			os.Exit(2)
 		}
-		writeOutcomeAndExit(context.Background(), logger, *correlationID, paths, nil)
+		restoreNs := os.Getenv("RESTORE_NAMESPACE")
+		if restoreNs == "" {
+			fmt.Fprintln(os.Stderr, "verify: RESTORE_NAMESPACE env required in presence mode (set by chart from per-drill restore-<short_hash>)")
+			os.Exit(2)
+		}
+		jobNs := os.Getenv("POD_NAMESPACE")
+		if jobNs == "" {
+			fmt.Fprintln(os.Stderr, "verify: POD_NAMESPACE env required (set by chart via downward API)")
+			os.Exit(2)
+		}
+		runPresenceModeAndExit(logger, *correlationID, paths, restoreNs, jobNs)
 	}
 
 	// Auth mode dispatch:
@@ -265,46 +282,104 @@ func requireFlagsRelaxed(correlationID, restoredURL, accessID string) error {
 	return fmt.Errorf("required args missing: %v", missing)
 }
 
-// writeOutcomeAndExit persists the drill-result-<correlation> ConfigMap and
-// exits cleanly. Used by --mode=presence which records every requested path
-// as retrieved without contacting the restored saas. The Composition's
-// upstream gates (4 RDS PITR Ready, 6 saas Pods Ready, canary-create Job
-// succeeded) are the proof; presence-mode just translates that proof into
-// the status.retrievedSecrets[] payload that the chart's observe Object
-// lifts into the XR's status.
+// runPresenceModeAndExit is the --mode=presence dispatch.
 //
-// Matches the human-script bar: the canonical staging_rds_restore_deploy_*
-// scripts never run /auth + /describe-item against the restored saas;
-// "successful deploy" = "infra deployed". This mode reports the same level
-// of certainty.
+// For each Check in presenceChecks(): run, accumulate result. NEVER fail-
+// fast — the operator's report aggregates every failure mode the run
+// encountered, with per-Check Diagnostics co-located in the result
+// ConfigMap.
 //
-// The api/k8s code paths below remain available; flip --mode=api when the
-// akeyless-internals (auth-microservice field-name parser, tenant routing
-// context) are sufficiently understood to do real /auth + /describe-item
-// against the restored saas.
-func writeOutcomeAndExit(ctx context.Context, logger interface {
+// Outcome shape:
+//   - retrievedSecrets:  always = paths (the canary path or operator-
+//     supplied secret list). presence-mode treats the Composition's
+//     upstream gates as the proof; the path was retrieved iff Checks
+//     all passed. Same semantic as api-mode but the proof is structural
+//     instead of a /describe-item round-trip.
+//   - missingSecrets:    paths if any Check failed (drives Phase=Failed)
+//   - checks:            the full per-Check report (passed/failed +
+//     description + message + diagnostics + duration)
+func runPresenceModeAndExit(logger interface {
 	Info(string, ...any)
 	Error(string, ...any)
-}, correlationID string, paths, missing []string) {
+}, correlationID string, paths []string, restoreNs, jobNs string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	env, err := newCheckEnv(correlationID, restoreNs, jobNs)
+	if err != nil {
+		logger.Error("build check env", "error", err.Error())
+		os.Exit(1)
+	}
+
+	logger.Info("running presence checks",
+		"check_count", len(presenceChecks()),
+		"restore_namespace", restoreNs,
+		"job_namespace", jobNs,
+	)
+
+	results := runChecks(ctx, env, presenceChecks())
+	summaries := make([]result.CheckSummary, 0, len(results))
+	for _, r := range results {
+		summaries = append(summaries, result.CheckSummary{
+			Name:        r.Name,
+			Description: r.Description,
+			Passed:      r.Passed,
+			Message:     r.Message,
+			Diagnostics: r.Diagnostics,
+			DurationMs:  r.DurationMs,
+		})
+		if r.Passed {
+			logger.Info("check passed", "name", r.Name, "duration_ms", r.DurationMs, "message", r.Message)
+		} else {
+			logger.Error("check failed", "name", r.Name, "duration_ms", r.DurationMs, "message", r.Message)
+		}
+	}
+
+	pass, fail := summarizeChecks(results)
+	allOk := allPassed(results)
+
+	// retrievedSecrets reflects the function-signature output:
+	// path was "found" iff every Check passed. missingSecrets carries
+	// the paths when the drill structurally failed.
+	var retrieved, missing []string
+	if allOk {
+		retrieved = paths
+		missing = []string{}
+	} else {
+		retrieved = []string{}
+		missing = paths
+	}
+
 	phase := result.PhaseSucceeded
-	if len(missing) > 0 {
+	if !allOk {
 		phase = result.PhaseFailed
 	}
-	cmName, err := result.WriteConfigMap(ctx, os.Getenv("POD_NAMESPACE"), result.Outcome{
+
+	cmName, err := result.WriteConfigMap(ctx, jobNs, result.Outcome{
 		CorrelationID:    correlationID,
-		RetrievedSecrets: paths,
+		RetrievedSecrets: retrieved,
 		MissingSecrets:   missing,
 		Phase:            phase,
+		Checks:           summaries,
 	})
 	if err != nil {
 		logger.Error("write result configmap (presence-mode)", "error", err.Error())
 		os.Exit(1)
 	}
-	logger.Info("result configmap written (presence-mode)", "configmap", cmName, "retrieved_count", len(paths))
-	if len(missing) > 0 {
-		logger.Error("presence-mode marked some paths missing", "missing", missing)
+	logger.Info("result configmap written (presence-mode)",
+		"configmap", cmName,
+		"checks_passed", pass,
+		"checks_failed", fail,
+		"retrieved_count", len(retrieved),
+		"missing_count", len(missing),
+	)
+
+	if !allOk {
+		logger.Error("presence checks failed; report includes diagnostics for each failed check",
+			"failed_count", fail,
+		)
 		os.Exit(1)
 	}
-	logger.Info("verify-presence succeeded", "count", len(paths))
+	logger.Info("verify-presence succeeded; all checks passed", "count", pass)
 	os.Exit(0)
 }
