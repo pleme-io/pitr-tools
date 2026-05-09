@@ -291,6 +291,15 @@ func watchPod(ctx context.Context, logger loggerIface, clientset *kubernetes.Cli
 
 	w, err := clientset.CoreV1().Pods(ns).Watch(ctx, metav1.ListOptions{LabelSelector: sel})
 	if err != nil {
+		// If the parent ctx was already cancelled by the time Watch()'s
+		// HTTP call returned, the cancellation propagates as a wrapped
+		// context.Canceled error here. That's the expected shutdown path
+		// (caller's serviceWg.Wait() returned cleanly, then cancel()
+		// fired before the watch goroutine got past Watch() establishment)
+		// — same semantics as the in-loop <-ctx.Done() arm below.
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return fmt.Errorf("pod watch failed (%s/%s): %w", ns, sel, err)
 	}
 	defer w.Stop()
