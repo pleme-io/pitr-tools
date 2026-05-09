@@ -71,6 +71,10 @@ func main() {
 		correlationID = flag.String("correlation-id", "", "filter to a specific drill correlation; empty = all drill-tagged instances")
 		kubeconfig    = flag.String("kubeconfig", os.Getenv("KUBECONFIG"), "path to kubeconfig (defaults to $KUBECONFIG)")
 		dryRun        = flag.Bool("dry-run", false, "report only; do not delete")
+		// feasibility-mode flags
+		restoreTime  = flag.String("restore-time", "", "[feasibility] candidate PITR restoreTime (RFC3339, e.g. 2026-05-09T19:42:09Z)")
+		sourceDbs    = flag.String("source-dbs", "", "[feasibility] comma-separated DBInstanceIdentifiers to validate against")
+		safetyMargin = flag.Duration("safety-margin", 60*time.Second, "[feasibility] subtract from each source's LatestRestorableTime; guards against the time gap between this check and the actual PITR call")
 	)
 	flag.Parse()
 
@@ -91,6 +95,19 @@ func main() {
 		os.Exit(1)
 	}
 	rdsClient := rds.NewFromConfig(awsCfg)
+
+	// feasibility mode skips the k8s dependency — pure AWS query, useful
+	// in pre-flight contexts where the operator hasn't applied a
+	// PITRSession yet (kubeconfig may be stale or pointed at a different
+	// cluster). Branch BEFORE the k8s dynamic client init.
+	if mode == "feasibility" {
+		if err := checkFeasibility(ctx, logger, rdsClient, *restoreTime, *sourceDbs, *safetyMargin); err != nil {
+			logger.Error("feasibility check failed", "error", err.Error())
+			os.Exit(2)
+		}
+		logger.Info("restoreTime is feasible across all source DBs", "restore_time", *restoreTime)
+		return
+	}
 
 	dynClient, err := newDynamicClient(*kubeconfig)
 	if err != nil {
@@ -120,9 +137,94 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "drill-cleanup: unknown mode %q (use 'list' or 'clean')\n", mode)
+		fmt.Fprintf(os.Stderr, "drill-cleanup: unknown mode %q (use 'list', 'clean', or 'feasibility')\n", mode)
 		os.Exit(2)
 	}
+}
+
+// checkFeasibility queries DescribeDBInstances for each source DB and
+// confirms the requested restoreTime is at least safetyMargin earlier
+// than every source's LatestRestorableTime. Pre-flight gate operators
+// run BEFORE applying a PITRSession — runs in seconds, no AWS PITR cost,
+// no chart deploy. Saves the full ~30s drill cycle when the chosen
+// restoreTime would have been rejected by AWS.
+//
+//	drill-cleanup -region us-east-2 \
+//	  -restore-time 2026-05-09T19:42:09Z \
+//	  -source-dbs mte-staging-auth,mte-staging-uam,mte-staging-unified \
+//	  feasibility
+//
+// Exit codes:
+//
+//	0 — restoreTime is feasible across ALL listed sources
+//	2 — at least one source's LatestRestorableTime < restoreTime + safety margin;
+//	    diagnostic identifies which DB and how many seconds short
+func checkFeasibility(ctx context.Context, logger interface {
+	Info(string, ...any)
+	Error(string, ...any)
+}, rdsClient *rds.Client, restoreTimeStr, sourceDbsStr string, safetyMargin time.Duration) error {
+	if restoreTimeStr == "" {
+		return fmt.Errorf("--restore-time required (RFC3339 e.g. 2026-05-09T19:42:09Z)")
+	}
+	if sourceDbsStr == "" {
+		return fmt.Errorf("--source-dbs required (comma-separated DBInstanceIdentifiers)")
+	}
+	restoreTime, err := time.Parse(time.RFC3339, restoreTimeStr)
+	if err != nil {
+		return fmt.Errorf("parse --restore-time: %w", err)
+	}
+	dbs := strings.Split(sourceDbsStr, ",")
+	type result struct {
+		db     string
+		latest time.Time
+		ok     bool
+		lagSec int64
+	}
+	results := make([]result, 0, len(dbs))
+	allOK := true
+	for _, db := range dbs {
+		db = strings.TrimSpace(db)
+		if db == "" {
+			continue
+		}
+		out, err := rdsClient.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
+			DBInstanceIdentifier: aws.String(db),
+		})
+		if err != nil {
+			results = append(results, result{db: db, ok: false})
+			logger.Error("describe-db-instances failed", "db", db, "error", err.Error())
+			allOK = false
+			continue
+		}
+		if len(out.DBInstances) == 0 || out.DBInstances[0].LatestRestorableTime == nil {
+			results = append(results, result{db: db, ok: false})
+			logger.Error("LatestRestorableTime not available", "db", db)
+			allOK = false
+			continue
+		}
+		latest := *out.DBInstances[0].LatestRestorableTime
+		ceiling := latest.Add(-safetyMargin)
+		ok := !restoreTime.After(ceiling)
+		lag := int64(restoreTime.Sub(latest).Seconds())
+		results = append(results, result{db: db, latest: latest, ok: ok, lagSec: lag})
+		if !ok {
+			allOK = false
+		}
+	}
+	for _, r := range results {
+		if r.ok {
+			fmt.Printf("OK     %-40s latest=%s\n", r.db, r.latest.UTC().Format(time.RFC3339))
+		} else if r.latest.IsZero() {
+			fmt.Printf("ERROR  %-40s describe failed or no LatestRestorableTime\n", r.db)
+		} else {
+			fmt.Printf("FAIL   %-40s latest=%s  restore-time is %ds AHEAD of latest (need negative)\n",
+				r.db, r.latest.UTC().Format(time.RFC3339), r.lagSec)
+		}
+	}
+	if !allOK {
+		return fmt.Errorf("at least one source DB rejects the requested restoreTime")
+	}
+	return nil
 }
 
 // findOrphans queries AWS RDS for every instance tagged with a drill
