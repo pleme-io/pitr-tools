@@ -483,13 +483,157 @@ func gatherEvents(ctx context.Context, k8s kubernetes.Interface, namespace strin
 	return out
 }
 
+// mrConditionsActionableCheck detects MRs in terminal-error states and
+// surfaces the AWS / provider error message as Diagnostics. Distinguishes
+// "still creating" (transient, just wait) from "AsyncCreateFailure"
+// (terminal — the next reconcile will hit the same error indefinitely).
+//
+// Drill #11 motivated this Check: bis RDS Instance MR was stuck with
+// LastAsyncOperation status=False reason=AsyncCreateFailure with message
+// "InvalidParameterValue: cannot be restored to a time later than X" —
+// AWS PITR per-DB binlog window violation. Without this Check, the drill
+// would hang for activeDeadlineSeconds (60 min) waiting for an MR that
+// will never reconcile to Ready=True.
+//
+// The signal pattern (Crossplane managed-resources convention):
+//   - Synced=False                     → reconcile error (provider-side)
+//   - LastAsyncOperation=False AND
+//     reason ∈ {AsyncCreateFailure,
+//               AsyncUpdateFailure,
+//               AsyncDeleteFailure}    → terminal AWS-side failure
+//   - Ready=False AND reason=Creating
+//     AND LastAsyncOperation=True
+//     (or absent)                      → transient (still in progress)
+//
+// On any terminal-failure detection: returns Passed=false with the full
+// LastAsyncOperation.message in Diagnostics, distinguishing this from
+// the rdsReadyCheck's "still creating" verdict. The operator's report
+// gets the precise AWS error string co-located with the MR identifier.
+//
+// Today this Check examines RDS Instance MRs; future iterations extend
+// the GVR list to cover akeyless drill identities (AuthMethod, Role, etc),
+// Route53 records when DNS provisioning lands, ACM cert MRs, etc.
+type mrConditionsActionableCheck struct{}
+
+func (mrConditionsActionableCheck) Name() string { return "mr-conditions-actionable" }
+func (mrConditionsActionableCheck) Description() string {
+	return "detect MRs in terminal-error states (AsyncCreateFailure / ReconcileError) and surface the provider error message — distinguishes terminal failures from in-progress creates so the operator's report is actionable, not hanging"
+}
+
+// terminalReasons collects the Crossplane LastAsyncOperation condition
+// reasons that indicate an unrecoverable async operation. Add reasons here
+// when new failure modes are observed (ReconcileError, etc.) — additive.
+var terminalReasons = map[string]bool{
+	"AsyncCreateFailure": true,
+	"AsyncUpdateFailure": true,
+	"AsyncDeleteFailure": true,
+}
+
+// gvrsExaminedForActionableConditions is the set of provider-aws-rds /
+// provider-kubernetes / etc. GVRs the Check inspects. Extending this slice
+// adds coverage without touching the Run() logic.
+var gvrsExaminedForActionableConditions = []schema.GroupVersionResource{
+	rdsInstanceGVR,
+	// Future: route53 RecordSet GVR, ACM Certificate GVR, akeyless
+	// AuthMethod GVR (when crossplane-akeyless lands), etc.
+}
+
+func (mrConditionsActionableCheck) Run(ctx context.Context, env *checkEnv) CheckResult {
+	type failedMR struct {
+		gvr     string
+		name    string
+		reason  string
+		message string
+	}
+	var terminal []failedMR
+	totalExamined := 0
+
+	for _, gvr := range gvrsExaminedForActionableConditions {
+		list, err := env.dyn.Resource(gvr).List(ctx, metav1.ListOptions{
+			LabelSelector: "pitr-correlation-id=" + env.correlationLab,
+		})
+		if err != nil {
+			// Listing failure for one GVR shouldn't fail-fast the Check;
+			// other GVRs may still surface actionable info.
+			continue
+		}
+		for _, item := range list.Items {
+			totalExamined++
+			conds, found, _ := nestedSlice(item.Object, "status", "conditions")
+			if !found {
+				continue
+			}
+			for _, c := range conds {
+				cm, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if cm["type"] != "LastAsyncOperation" {
+					continue
+				}
+				status, _ := cm["status"].(string)
+				reason, _ := cm["reason"].(string)
+				if status != "False" || !terminalReasons[reason] {
+					continue
+				}
+				msg, _ := cm["message"].(string)
+				terminal = append(terminal, failedMR{
+					gvr:     gvr.String(),
+					name:    item.GetName(),
+					reason:  reason,
+					message: msg,
+				})
+			}
+		}
+	}
+
+	if len(terminal) == 0 {
+		return CheckResult{
+			Passed:  true,
+			Message: fmt.Sprintf("no MRs in terminal-error state (examined %d MRs across %d GVRs)", totalExamined, len(gvrsExaminedForActionableConditions)),
+		}
+	}
+
+	// Build operator-actionable Diagnostics. Each terminal failure gets a
+	// keyed entry: <gvr>/<name>.{reason,message}. The provider message
+	// goes through verbatim — typically carries the AWS api error string
+	// like "InvalidParameterValue: cannot be restored to a time later
+	// than X" — directly actionable for the operator.
+	diag := map[string]string{
+		"terminal_count": fmt.Sprintf("%d", len(terminal)),
+		"total_examined": fmt.Sprintf("%d", totalExamined),
+	}
+	names := []string{}
+	for _, t := range terminal {
+		names = append(names, t.name)
+		diag[t.name+".gvr"] = t.gvr
+		diag[t.name+".reason"] = t.reason
+		diag[t.name+".message"] = t.message
+	}
+	sort.Strings(names)
+	return CheckResult{
+		Passed:      false,
+		Message:     fmt.Sprintf("%d MRs in terminal-error state — drill cannot reach Ready: %s", len(terminal), joinTrimmed(names)),
+		Diagnostics: diag,
+	}
+}
+
 // presenceChecks is the canonical Check set for --mode=presence today.
 // New Checks land here additively (Pillar 12: generation grows; never
 // shrinks). When akeyless-internals are sufficiently understood,
 // authCheck + describeItemCheck land in --mode=api as the next layer
 // and this list extends accordingly.
+//
+// Order matters for diagnostic ergonomics:
+//   1. mr-conditions-actionable runs FIRST so terminal failures surface
+//      before any "Ready=False" Check muddies the report. The operator's
+//      first failed-Check is the actionable one.
+//   2. rds-pitr-ready / saas-deployments-ready report progress state.
+//   3. configmaps-cloned + canary-create-succeeded validate static
+//      preconditions.
 func presenceChecks() []Check {
 	return []Check{
+		mrConditionsActionableCheck{},
 		rdsReadyCheck{},
 		configMapsClonedCheck{},
 		deploymentsReadyCheck{},
