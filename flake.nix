@@ -16,7 +16,7 @@
 
   outputs = { self, nixpkgs, flake-utils, substrate, forge, ... }:
     let
-      version = "0.2.0";
+      version = "0.3.0";
       registry = "ghcr.io/pleme-io/pitr-tools";
       binNames = [
         "notify"
@@ -78,7 +78,7 @@
             pname = "pitr-tools";
             inherit version;
             src = self;
-            vendorHash = "sha256-4vavYlYKTZci3xAPzKn7ZS0yd75KcwlXC7+4vbQbsU8=";
+            vendorHash = "sha256-m2cEWPSV1F4ErkquDHUeDDWEGAMhH9b1z4lIe18NrXs=";
             subPackages = map (n: "cmd/${n}") binNames;
             env.CGO_ENABLED = "0";
             ldflags = [ "-s" "-w" "-X main.version=${version}" ];
@@ -116,7 +116,7 @@
           pname = "pitr-tools";
           inherit version;
           src = self;
-          vendorHash = "sha256-4vavYlYKTZci3xAPzKn7ZS0yd75KcwlXC7+4vbQbsU8=";
+          vendorHash = "sha256-m2cEWPSV1F4ErkquDHUeDDWEGAMhH9b1z4lIe18NrXs=";
           subPackages = map (n: "cmd/${n}") binNames;
           env.CGO_ENABLED = "0";
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
