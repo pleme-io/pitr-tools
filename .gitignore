@@ -19,3 +19,12 @@ coverage.txt
 # Local artifacts
 *.tar
 *.tar.gz
+
+# Compiled binaries at repo root from `go build ./cmd/<n>/`
+/canary-create
+/canary-delete
+/diagnostic-collect
+/drill-cleanup
+/notify
+/verify
+/wait-for-deps
