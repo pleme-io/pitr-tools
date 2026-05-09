@@ -16,7 +16,7 @@
 
   outputs = { self, nixpkgs, flake-utils, substrate, forge, ... }:
     let
-      version = "0.3.0";
+      version = "0.3.1";
       registry = "ghcr.io/pleme-io/pitr-tools";
       binNames = [
         "notify"
